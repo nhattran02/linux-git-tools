@@ -24,6 +24,8 @@ Commands:
   list   <range>...        list commits in <range> (e.g. mainline/v6.12..mainline/master)
   check  <commit|range|->  check commits against the local branch ("-" = read shas from stdin)
   check  -L <list>         check every commit of a saved list
+  since  <commit|range|->  when did a commit land (mainline release, linux-next, stable)
+                           and should it be ported to the local version? (also -L <list>)
   pid    <commit>...       print the patch-id of commits
   lists                    show saved lists
   show   <list>            print a saved list
@@ -39,7 +41,10 @@ Options:
   -a             with -s: append to an existing list instead of replacing it
   -L <name>      check: use a saved list (its saved paths are used unless -- is given)
   -m             check: hide commits already present (HAVE)
-  -c             check/list: CSV output
+  -c             check/list/since: CSV output
+  -r             check: add a RELEASE column (first mainline tag, or next-YYYYMMDD)
+  -S             since: also look in stable/linux-X.Y.y (X.Y = version of the local branch,
+                 read from its Makefile); fetches that branch and its tags if missing
   -F             always fetch remote refs before use (refresh)
   -N             never fetch (offline)
 
@@ -73,6 +78,9 @@ Examples:
   bpcheck.sh check -L sci -m
   bpcheck.sh check -L sci -m -s sci-todo          # keep only what is still missing
   bpcheck.sh check c3ca8a0aac83 92b1ea22454b
+  bpcheck.sh check -r -L sci -m                   # with the release each commit landed in
+  bpcheck.sh since c982f96e8684                   # when did it land, port it or not?
+  bpcheck.sh since -S -L sci-todo                 # same, also looking into stable X.Y.y
   bpcheck.sh check -l g3s/dev mainline/master..next/master -- drivers/watchdog/rzg2l_wdt.c
   bpcheck.sh list stable/linux-6.12.y~50..stable/linux-6.12.y -- drivers/tty/serial/
   git log --format=%H --grep=sh-sci v6.12..v6.18 | bpcheck.sh check -
@@ -82,7 +90,7 @@ EOF
 die()  { echo "bpcheck: $*" >&2; exit 1; }
 info() { echo "bpcheck: $*" >&2; }
 
-FETCH=auto LOCAL=HEAD MISSING_ONLY=0 CSV=0 SAVE= APPEND=0 LIST=
+FETCH=auto LOCAL=HEAD MISSING_ONLY=0 CSV=0 SAVE= APPEND=0 LIST= SHOW_REL=0 WITH_STABLE=0
 PATHS=() ARGS=()
 declare -A FETCHED=()
 
@@ -97,6 +105,8 @@ parse() {
 		-a) APPEND=1 ;;
 		-m) MISSING_ONLY=1 ;;
 		-c) CSV=1 ;;
+		-r) SHOW_REL=1 ;;
+		-S) WITH_STABLE=1 ;;
 		-h|--help) usage; exit 0 ;;
 		--) shift; PATHS=("$@"); break ;;
 		-?*) die "unknown option '$1' (see: bpcheck.sh help)" ;;
@@ -331,40 +341,110 @@ cmd_list() {
 	fi
 }
 
-cmd_check() {
-	local -a shas=()
-	local a x rest c sha date subj total=0 todo=
-	declare -A count=()
-
+# collect_shas <cmd>: fill SHAS from -L <list>, ARGS (commits, ranges, "-" = stdin)
+SHAS=()
+collect_shas() {
+	local a x rest
 	if [ -n "$LIST" ]; then
 		read_list "$LIST"
-		shas+=(${LIST_SHAS[@]+"${LIST_SHAS[@]}"})
+		SHAS+=(${LIST_SHAS[@]+"${LIST_SHAS[@]}"})
 		[ ${#PATHS[@]} -gt 0 ] || PATHS=(${LIST_PATHS[@]+"${LIST_PATHS[@]}"})
 	fi
 	for a in ${ARGS[@]+"${ARGS[@]}"}; do
 		if [ "$a" = - ]; then
 			while read -r x rest; do
-				[[ -z $x || $x == \#* ]] || shas+=("$x")
+				[[ -z $x || $x == \#* ]] || SHAS+=("$x")
 			done
 		elif [[ $a == *..* ]]; then
 			resolve_spec "$a"
-			mapfile -t -O ${#shas[@]} shas < <(git log --no-merges --format=%H "$a" -- ${PATHS[@]+"${PATHS[@]}"})
+			mapfile -t -O ${#SHAS[@]} SHAS < <(git log --no-merges --format=%H "$a" -- ${PATHS[@]+"${PATHS[@]}"})
 		else
 			resolve_rev "$a"
-			shas+=("$(git rev-parse "$a^{commit}")")
+			SHAS+=("$(git rev-parse "$a^{commit}")")
 		fi
 	done
-	[ ${#shas[@]} -gt 0 ] || die "check: nothing to check (give commits, a range, '-' or -L <list>)"
+	[ ${#SHAS[@]} -gt 0 ] || die "$1: nothing to do (give commits, a range, '-' or -L <list>)"
 	resolve_rev "$LOCAL"
+}
+
+# ---------------------------------------------------------------- versions
+
+# local_version: LVER (e.g. 6.12) and LSUB (e.g. 59) from the Makefile of LOCAL
+local_version() {
+	local mk
+	LVER= LSUB=
+	mk=$(git show "$LOCAL:Makefile" 2>/dev/null) || return 0
+	LVER=$(sed -n 's/^VERSION = //p' <<<"$mk").$(sed -n 's/^PATCHLEVEL = //p' <<<"$mk")
+	LSUB=$(sed -n 's/^SUBLEVEL = //p' <<<"$mk")
+	[ "$LVER" != . ] || LVER=
+}
+
+# ver_le <a> <b>: true if version a <= b
+ver_le() { printf '%s\n%s\n' "$1" "$2" | sort -V -C; }
+
+# release_of <commit>: REL (first mainline tag, e.g. v7.3-rc1), RELV (7.3) and,
+# only when it is not in a release yet, NEXT (first next-YYYYMMDD tag).
+# Stable tags are excluded: vX.Y.Z for X >= 3, v2.6.X.Y (v2.6.X itself is mainline).
+release_of() {
+	local d
+	REL= RELV= NEXT=
+	if d=$(git describe --contains --match 'v[0-9]*' --exclude 'v[3-9].*.*' \
+		--exclude 'v[1-9][0-9].*.*' --exclude 'v2.6.*.*' "$1" 2>/dev/null); then
+		REL=${d%%[~^]*} RELV=${REL#v} RELV=${RELV%%-rc*}
+		return 0
+	fi
+	if d=$(git describe --contains --match 'next-*' "$1" 2>/dev/null); then
+		NEXT=${d%%[~^]*}
+	fi
+}
+
+# setup_stable: make stable/linux-<LVER>.y and its v<LVER>.* tags available
+STABLE_REF=
+setup_stable() {
+	[ -n "$LVER" ] || die "cannot read the kernel version of $LOCAL (no Makefile?)"
+	STABLE_REF=stable/linux-$LVER.y
+	resolve_rev "$STABLE_REF"
+	if [ "$FETCH" != never ] &&
+	   { [ "$FETCH" = always ] || ! git rev-parse -q --verify "refs/tags/v$LVER.1" >/dev/null; }; then
+		info "fetching stable tags v$LVER.*"
+		git fetch --no-tags stable "+refs/tags/v$LVER.*:refs/tags/v$LVER.*" >&2 ||
+			info "warning: could not fetch stable tags, versions will be missing"
+	fi
+}
+
+# stable_of <commit>: STC (stable backport sha) and STB (first stable tag, e.g. v6.12.60)
+stable_of() {
+	local full d range=$STABLE_REF
+	STC= STB=
+	[ -n "$STABLE_REF" ] || return 0
+	full=$(git rev-parse "$1^{commit}")
+	git rev-parse -q --verify "v$LVER^{commit}" >/dev/null && range=v$LVER..$STABLE_REF
+	STC=$(git log -1 --format=%h --abbrev=12 -F --grep="$full" "$range")
+	[ -n "$STC" ] || return 0
+	if d=$(git describe --contains --match "v$LVER.*" "$STC" 2>/dev/null); then
+		STB=${d%%[~^]*}
+	fi
+}
+
+cmd_check() {
+	local c sha date subj total=0 todo= rel
+	declare -A count=()
+
+	collect_shas check
+	[ "$SHOW_REL" = 1 ] && local_version
 
 	colors
-	if [ "$CSV" = 1 ]; then
+	if [ "$CSV" = 1 ] && [ "$SHOW_REL" = 1 ]; then
+		echo "status,sha,date,release,fix,local,subject"
+	elif [ "$CSV" = 1 ]; then
 		echo "status,sha,date,fix,local,subject"
+	elif [ "$SHOW_REL" = 1 ]; then
+		printf '%s%-8s %-12s %-10s %-14s %-4s %-12s %s%s\n' "$D" STATUS SHA DATE RELEASE FIX LOCAL SUBJECT "$N"
 	else
 		printf '%s%-8s %-12s %-10s %-4s %-12s %s%s\n' "$D" STATUS SHA DATE FIX LOCAL SUBJECT "$N"
 	fi
 
-	for c in "${shas[@]}"; do
+	for c in "${SHAS[@]}"; do
 		total=$((total + 1))
 		find_local "$c"
 		local st=$ST lm=$LM col
@@ -383,13 +463,19 @@ cmd_check() {
 		[ "$st" != HAVE ] && todo+="$(git rev-parse -q --verify "$c^{commit}" 2>/dev/null || echo "$c")"$'\t'"$subj"$'\n'
 		[ "$MISSING_ONLY" = 1 ] && [ "$st" = HAVE ] && continue
 
+		rel=
+		if [ "$SHOW_REL" = 1 ]; then
+			release_of "$c"
+			rel=${REL:-${NEXT:--}}
+		fi
 		if [ "$CSV" = 1 ]; then
-			printf '%s,%s,%s,%s,%s,"%s"\n' "$st" "$sha" "$date" "$FIX" "$lm" "${subj//\"/\"\"}"
+			printf '%s,%s,%s,%s%s,%s,"%s"\n' "$st" "$sha" "$date" \
+				"${rel:+$rel,}" "$FIX" "$lm" "${subj//\"/\"\"}"
 		else
 			local fc=$N
 			[ "$FIX" = yes ] && fc=$R
-			printf '%s%-8s%s %-12s %-10s %s%-4s%s %-12s %s\n' "$col" "$st" "$N" \
-				"$sha" "$date" "$fc" "$FIX" "$N" "${lm:--}" "$subj"
+			printf '%s%-8s%s %-12s %-10s %s%s%-4s%s %-12s %s\n' "$col" "$st" "$N" \
+				"$sha" "$date" "${rel:+$(printf '%-14s ' "$rel")}" "$fc" "$FIX" "$N" "${lm:--}" "$subj"
 		fi
 	done
 
@@ -399,6 +485,74 @@ cmd_check() {
 	if [ -n "$SAVE" ]; then
 		printf '%s' "$todo" | save_list "$SAVE" "check (not HAVE) against $LOCAL ${LIST:+of list $LIST }${ARGS[*]:-}"
 	fi
+}
+
+cmd_since() {
+	local c sha subj verdict where st lm
+	collect_shas since
+	local_version
+	[ "$WITH_STABLE" = 1 ] && setup_stable
+
+	colors
+	[ "$CSV" = 1 ] && echo "sha,mainline,release,next,stable,stable_sha,fix,local,local_sha,verdict,subject"
+	for c in "${SHAS[@]}"; do
+		if ! git cat-file -e "$c^{commit}" 2>/dev/null; then
+			info "$c: commit not available locally (fetch the tree that has it first)"
+			continue
+		fi
+		sha=$(git rev-parse --short=12 "$c")
+		subj=$(git log -1 --format=%s "$c")
+		release_of "$c"
+		stable_of "$c"
+		fix_status "$c"
+		find_local "$c"
+		st=$ST lm=$LM
+
+		if [ "$st" = HAVE ]; then
+			verdict="already in $LOCAL"
+		elif [ -z "$REL" ] && [ -n "$NEXT" ]; then
+			verdict="only in linux-next, not released yet: wait or take it from next"
+		elif [ -z "$REL" ]; then
+			verdict="not in any mainline release tag (unreleased, or not a mainline commit)"
+		elif [ -n "$LVER" ] && ver_le "$RELV" "$LVER"; then
+			verdict="in v$RELV <= local v$LVER: should already be in the base (reverted/dropped locally?)"
+		elif [ -n "$STC" ]; then
+			verdict="in stable ${STB:-$STABLE_REF}: comes with the next stable/CIP update"
+		elif [ "$st" = TAG ] || [ "$st" = SUBJ ]; then
+			verdict="newer than v${LVER:-?}, backported with changes: compare with range-diff"
+		else
+			verdict="newer than v${LVER:-?} (since v$RELV): backport candidate, check API/deps"
+		fi
+		if [ "$st" = MISSING ] && [ -n "$REL" ]; then
+			case $FIX in
+			yes) verdict+="; FIX for code you have" ;;
+			n/a) verdict+="; fix for code you do not have" ;;
+			-)   verdict+="; not a fix (no Fixes: tag)" ;;
+			esac
+		fi
+
+		if [ "$CSV" = 1 ]; then
+			printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,"%s","%s"\n' "$sha" "${REL:-}" "${RELV:-}" \
+				"${NEXT:-}" "${STB:-}" "${STC:-}" "$FIX" "$st" "$lm" "$verdict" "${subj//\"/\"\"}"
+			continue
+		fi
+		printf '%s%s%s %s\n' "$Y" "$sha" "$N" "$subj"
+		if [ -n "$REL" ]; then
+			printf '  mainline : %s (release v%s)\n' "$REL" "$RELV"
+		else
+			printf '  mainline : not in a release tag\n'
+			printf '  next     : %s\n' "${NEXT:-not in a next-* tag}"
+		fi
+		printf '  fix      : %s\n' "$FIX"
+		if [ -n "$STABLE_REF" ]; then
+			where="not in $STABLE_REF"
+			[ -n "$STC" ] && where="${STB:-in $STABLE_REF} ($STC)"
+			printf '  stable   : %s\n' "$where"
+		fi
+		printf '  local    : %s%s%s%s (%s is v%s%s)\n' "$( [ "$st" = HAVE ] && echo "$G" || echo "$R")" \
+			"$st" "$N" "${lm:+ $lm}" "$LOCAL" "${LVER:-?}" "${LSUB:+.$LSUB}"
+		printf '  verdict  : %s\n\n' "$verdict"
+	done
 }
 
 cmd_pid() {
@@ -486,6 +640,7 @@ parse "$@"
 case $CMD in
 list)    cmd_list ;;
 check)   cmd_check ;;
+since)   cmd_since ;;
 pid)     cmd_pid ;;
 lists)   cmd_lists ;;
 show)    cmd_show ;;
